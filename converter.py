@@ -13,25 +13,9 @@ import sys
 from builtins import isinstance
 
 URI_STRING ="mongodb://localhost:27017/demo"
-#URI_STRING = "mongodb+srv://demo:demo00@demofacturas-la6ky.mongodb.net/test?retryWrites=true&w=majority"
-#URI_STRING="mongodb+srv://demo:demo00@demo-la6ky.mongodb.net/test?retryWrites=true"
 
-#DATADIR ="/Users/mancilla/Desktop/xmls_con_errores_088_164"
-DATADIR = "/Users/mancilla/Desktop/xmls_02octubre2018_parte_088_164/"
-#DATADIR = "/home/ec2-user/xmls"
+DATADIR = "/home/ec2-user/xmls"
 
-CFDI_v3 ="{http://www.sat.gob.mx/cfd/3}"
-TIMBRE_FISCAL = "{http://www.sat.gob.mx/TimbreFiscalDigital}"
-NOMINA = "{http://www.sat.gob.mx/nomina12}"
-XML_SCHEMA = "{http://www.w3.org/2001/XMLSchema-instance}"
-TERCEROS = "{http://www.sat.gob.mx/terceros}"
-PAGOS = "{http://www.sat.gob.mx/Pagos}"
-IMP_LOCAL = "{http://www.sat.gob.mx/implocal}"
-REG_FISCAL = "{http://www.sat.gob.mx/registrofiscal}"
-COM_EXT = "{http://www.sat.gob.mx/ComercioExterior11}"
-DETALLISTA = "{http://www.sat.gob.mx/detallista}"
-IEDU ="{http://www.sat.gob.mx/iedu}"
-AERO = "{http://www.sat.gob.mx/aerolineas}"
 
 VALUE = "$t"
 EMPTY = "\""
