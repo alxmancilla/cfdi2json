@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # Python 3 only
 
-from xmljson import gdata as bf
+from xmljson import GData
 from xml.etree.ElementTree import fromstring
 import pymongo
+from pymongo import InsertOne, ReplaceOne
+from pymongo.errors import BulkWriteError, ConnectionFailure, OperationFailure
 import json
 import fnmatch
 import os
 import datetime
 import re
 import sys
-from builtins import isinstance
 
 def load_env(path):
     # load KEY=VALUE pairs from a .env file without overriding existing environment variables
@@ -30,32 +31,79 @@ URI_STRING = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME = os.environ.get("MONGODB_DATABASE", "demo")
 COLLECTION_NAME = os.environ.get("MONGODB_COLLECTION", "cfdi")
 
-DATADIR = os.environ.get("DATADIR", "/home/ec2-user/xmls")
+DATADIR = os.environ.get("DATADIR", "./xmls")
 
+BATCH_SIZE = 500
+UUID_FIELD = "Comprobante.Complemento.TimbreFiscalDigital.UUID"
 
 VALUE = "$t"
 EMPTY = "\""
 regex = re.compile(r"\"\{http.*\w\}")
-file_name = ""
+# only plain numbers become int/float; codes with leading zeros, exponents or more than 15 digits stay strings
+NUMBER = re.compile(r"^-?(0|[1-9][0-9]{0,14})(\.[0-9]+)?$")
+DATE_FORMATS = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f")
+NOMINA_STRING_KEYS = {
+    "Banco", "Clave", "CuentaBancaria", "NumEmpleado", "NumSeguridadSocial",
+    "PeriodicidadPago", "RegistroPatronal", "RiesgoPuesto", "TipoContrato",
+    "TipoDeduccion", "TipoHoras", "TipoIncapacidad", "TipoJornada",
+    "TipoOtroPago", "TipoPercepcion", "TipoRegimen",
+}
 
-def traverse_directories(conn, base_dir):
+
+def parse_value(value):
+    if value is None or not NUMBER.match(value):
+        return value
+    if "." in value:
+        return float(value)
+    return int(value)
+
+
+bf = GData(xml_fromstring=parse_value)
+
+
+def parse_date(value):
+    for date_format in DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(value, date_format)
+        except ValueError:
+            pass
+    print("Warning: unrecognized Fecha format, stored as string:", value)
+    return value
+
+
+def stringify_keys(node, keys):
+    # convert numeric values of the given keys to strings at any depth
+    if isinstance(node, list):
+        for item in node:
+            stringify_keys(item, keys)
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            if key in keys and isinstance(value, (int, float)):
+                node[key] = str(value)
+            else:
+                stringify_keys(value, keys)
+
+
+def traverse_directories(conn, base_dir, batch):
     print("directory: ", base_dir)
     list_files = os.listdir(base_dir)
     for a in list_files:
-            file_name = base_dir +'/'+ a
-            #print(abs_path)
+            file_name = os.path.join(base_dir, a)
             if os.path.isdir(file_name):
-                traverse_directories(conn, file_name)
+                traverse_directories(conn, file_name, batch)
             elif fnmatch.fnmatch(a, '*.xml'):
-                try: 
+                try:
                     document = convertXML2JSON(file_name)
-                    document = coerceDataTypes(document)  
-                    write_document(conn, document, file_name)
+                    document = coerceDataTypes(document)
                 except Exception as e:
                     print("Exception filename", file_name)
                     print("Exception e: ", e)
                     continue
-   
+                batch.append((file_name, document))
+                if len(batch) >= BATCH_SIZE:
+                    write_documents(conn, batch)
+                    batch.clear()
+
 
 def coerceDataTypes(document):
     comprobante = document["Comprobante"]
@@ -63,7 +111,7 @@ def coerceDataTypes(document):
         if item == "NoCertificado":
             comprobante["NoCertificado"] = str(comprobante["NoCertificado"])
         elif item == "Fecha":
-            comprobante["Fecha"] = datetime.datetime.strptime(comprobante["Fecha"], "%Y-%m-%dT%H:%M:%S")
+            comprobante["Fecha"] = parse_date(str(comprobante["Fecha"]))
         elif item == "Folio":
             comprobante["Folio"] = str(comprobante["Folio"])
         elif item == "Serie":
@@ -77,6 +125,9 @@ def coerceDataTypes(document):
                     comprobante["Complemento"]["CFDIRegistroFiscal"]["Folio"] = str(comprobante["Complemento"]["CFDIRegistroFiscal"]["Folio"])
                 if compitem == "TimbreFiscalDigital":
                     comprobante["Complemento"]["TimbreFiscalDigital"]["NoCertificadoSAT"] = str(comprobante["Complemento"]["TimbreFiscalDigital"]["NoCertificadoSAT"])
+
+                if compitem == "Nomina":
+                    stringify_keys(comprobante["Complemento"]["Nomina"], NOMINA_STRING_KEYS)
 
                 if compitem == "ConsumoDeCombustibles":
                     #print("ConsumoDeCombustibles: ... ", comprobante["Complemento"]["ConsumoDeCombustibles"])
@@ -192,56 +243,82 @@ def coerceDataTypes(document):
     
     
 def convertXML2JSON(file):
-    # get file name
-    #name = str.split(file, ".")[-2]
-    #print(name)
     # open the XML file, convert to json and return it as an object
     with open(file, "rb") as input:
-        jsonOut = bf.data(fromstring(input.read())) 
-        jsonString = json.dumps(jsonOut, indent=2)   
-        #jsonString = json.dumps(jsonOut)   
-        
+        jsonOut = bf.data(fromstring(input.read()))
+        jsonString = json.dumps(jsonOut, indent=2)
+
         result = regex.sub(EMPTY, jsonString)
         result = result.replace(VALUE, "value")
-        
-    return json.loads(result)
- 
-def write_document(conn, doc, file_name):
-    #print("inserting employee: ", doc["emp_no"])
-    try:
-        collection = conn[DB_NAME][COLLECTION_NAME]
-        result = collection.insert_one(doc)
-        return result
-    except Exception as e:
-        print("¡¡¡ERROR!!!!", e.args[0])
-        print("filename: " + file_name)
 
-        return False
-   
+    return json.loads(result)
+
+
+def get_uuid(doc):
+    complementos = doc["Comprobante"].get("Complemento")
+    if not isinstance(complementos, list):
+        complementos = [complementos]
+    for complemento in complementos:
+        if isinstance(complemento, dict) and isinstance(complemento.get("TimbreFiscalDigital"), dict):
+            return complemento["TimbreFiscalDigital"].get("UUID")
+    return None
+
+
+def ensure_indexes(conn):
+    collection = conn[DB_NAME][COLLECTION_NAME]
+    try:
+        collection.create_index(UUID_FIELD, unique=True,
+                                partialFilterExpression={UUID_FIELD: {"$exists": True}})
+    except OperationFailure as e:
+        print("Warning: could not create unique index on %s: %s" % (UUID_FIELD, e))
+
+
+def write_documents(conn, batch):
+    # upsert stamped CFDIs by UUID so re-runs do not create duplicates
+    collection = conn[DB_NAME][COLLECTION_NAME]
+    requests = []
+    for file_name, doc in batch:
+        uuid = get_uuid(doc)
+        if uuid:
+            requests.append(ReplaceOne({UUID_FIELD: uuid}, doc, upsert=True))
+        else:
+            requests.append(InsertOne(doc))
+    try:
+        result = collection.bulk_write(requests, ordered=False)
+        print("batch written: %d new without UUID, %d new by UUID, %d existing replaced"
+              % (result.inserted_count, result.upserted_count, result.matched_count))
+    except BulkWriteError as e:
+        for error in e.details["writeErrors"]:
+            print("¡¡¡ERROR!!!!", error["errmsg"])
+            print("filename: " + batch[error["index"]][0])
+    except Exception as e:
+        print("¡¡¡ERROR!!!!", e)
+        print("files in failed batch:", [file_name for file_name, _ in batch])
+
+
 if __name__ == "__main__":
     print("This is the name of the script: ", sys.argv[0])
     if len(sys.argv) > 1:
         print("This is the argument of the script: ", sys.argv[1])
         DATADIR = sys.argv[1]
+    conn = None
     try:
-        conn = pymongo.MongoClient(URI_STRING)
+        conn = pymongo.MongoClient(URI_STRING, serverSelectionTimeoutMS=5000)
+        conn.admin.command("ping")
         print("Connected to MongoDB")
+        ensure_indexes(conn)
         start_time = datetime.datetime.utcnow()
         print("start time: ", start_time)
-        traverse_directories(conn, DATADIR)
+        batch = []
+        traverse_directories(conn, DATADIR, batch)
+        if batch:
+            write_documents(conn, batch)
         end_time = datetime.datetime.utcnow()
         print("end time: ", end_time)
-        print( (end_time - start_time), " seconds")
+        print("%.2f seconds" % (end_time - start_time).total_seconds())
         print("Operation completed successfully!!!")
-          
-    except OverflowError as error:
-        # Output expected OverflowErrors.
-        print("error: %s" % error)
-        print("file name: %s" % file_name)
-    except pymongo.errors.ConnectionFailure as e:
+    except ConnectionFailure as e:
         print("Could not connect to MongoDB: %s" % e)
-    conn.close()    
-
-    # para listar archivos en directorio os.listdir(path)
-    #read_image(imagefile)
-    #find_directories(DATADIR)
+    finally:
+        if conn is not None:
+            conn.close()
