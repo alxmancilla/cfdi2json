@@ -41,16 +41,22 @@ pip install xmljson pymongo
 
 ## Configuration
 
-Settings are read from a `.env` file in the project directory. Environment variables already set in the shell take precedence over values in `.env`.
+Settings are read from a `.env` file in the project directory. This file is excluded from version control (see `.gitignore`), so create it from the provided template:
 
-| Variable             | `.env` value                 | Description                                  |
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` with your values. Environment variables already set in the shell take precedence over values in `.env`.
+
+| Variable             | `.env.example` value         | Description                                  |
 |----------------------|------------------------------|----------------------------------------------|
 | `MONGODB_URI`        | `mongodb://localhost:27017`  | MongoDB connection string                    |
 | `MONGODB_DATABASE`   | `demo`                       | Target database                              |
 | `MONGODB_COLLECTION` | `cfdi`                       | Target collection                            |
 | `DATADIR`            | `./xmls`                     | Directory scanned when no argument is given  |
 
-If a variable is not set, `converter.py` uses the same defaults, except `DATADIR`, which falls back to `/home/ec2-user/xmls`. A relative `DATADIR` is resolved against the current working directory.
+If `.env` is missing or a variable is not set, `converter.py` uses the same defaults, except `DATADIR`, which falls back to `/home/ec2-user/xmls`. A relative `DATADIR` is resolved against the current working directory.
 
 Example override from the shell:
 
@@ -58,7 +64,7 @@ Example override from the shell:
 MONGODB_URI="mongodb+srv://<user>:<password>@<cluster>/" python3 converter.py
 ```
 
-> Do not commit real credentials in `.env`.
+> Keep real credentials only in `.env`. When adding a new setting, also add it to `.env.example` with a placeholder value.
 
 ## Usage
 
@@ -66,7 +72,7 @@ MONGODB_URI="mongodb+srv://<user>:<password>@<cluster>/" python3 converter.py
 python3 converter.py [path/to/xml/directory]
 ```
 
-With the default `.env`, running the script without arguments loads the bundled sample files from `./xmls`.
+With a `.env` copied from `.env.example`, running the script without arguments loads the bundled sample files from `./xmls`.
 
 The script prints the start time, end time, and total elapsed time.
 
