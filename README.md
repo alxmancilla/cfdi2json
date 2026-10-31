@@ -183,5 +183,19 @@ python3 converter.py
 
 ## Known limitations
 
-- Only CFDI 3.3 and later documents (`cfdi:Comprobante` root) are supported.
+- Only CFDI 3.3 and later documents (`cfdi:Comprobante` root) are supported. The type and array rules have only been tested with CFDI 3.3 files; see [Roadmap](#roadmap) for CFDI 4.0.
 - Attributes that are not in the amount, integer, or date lists are stored as strings. New amount fields from other complements must be added to `DECIMAL_KEYS` in `converter.py`.
+- The invoice and its signature document are written separately, not in a transaction.
+
+## Roadmap
+
+Pending work, in suggested order:
+
+1. **CFDI 4.0 and Pagos 2.0 support.** CFDI 4.0 has been the required version since 2023. Its files are accepted, but:
+   - New amount fields such as `BaseDR`, `ImporteDR`, `BaseP`, `ImporteP`, and `EquivalenciaDR` are not in `DECIMAL_KEYS` and are stored as strings. Fields starting with `Total` (e.g. `MontoTotalPagos`, `TotalTrasladosBaseIVA16`) are already stored as decimals.
+   - Repeatable elements such as `TrasladoDR`, `RetencionDR`, `TrasladoP`, and `RetencionP` are not in `ARRAY_KEYS`, so they are stored as an object when they appear once and as an array when they repeat.
+   - Add anonymized CFDI 4.0 samples to `xmls/` to verify the changes.
+2. **Automated tests.** Add unit tests (no MongoDB needed) for value conversion, array handling, signature extraction, and `_id` assignment.
+3. **Default database name.** The code default and the examples in this README use `demo`, while `.env.example` uses `demo_cfdi`. Align them.
+4. **Atlas access.** Use a database user limited to `readWrite` on the target database, and restrict the cluster's IP access list to the machines that run the import.
+5. **Secondary indexes.** Create indexes once the main query patterns are known (see [Example queries](#example-queries)).
