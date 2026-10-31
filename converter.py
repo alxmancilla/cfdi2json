@@ -12,9 +12,25 @@ import re
 import sys
 from builtins import isinstance
 
-URI_STRING ="mongodb://localhost:27017/demo"
+def load_env(path):
+    # load KEY=VALUE pairs from a .env file without overriding existing environment variables
+    if not os.path.isfile(path):
+        return
+    with open(path) as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
-DATADIR = "/home/ec2-user/xmls"
+load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+URI_STRING = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
+DB_NAME = os.environ.get("MONGODB_DATABASE", "demo")
+COLLECTION_NAME = os.environ.get("MONGODB_COLLECTION", "cfdi")
+
+DATADIR = os.environ.get("DATADIR", "/home/ec2-user/xmls")
 
 
 VALUE = "$t"
@@ -193,7 +209,7 @@ def convertXML2JSON(file):
 def write_document(conn, doc, file_name):
     #print("inserting employee: ", doc["emp_no"])
     try:
-        collection = conn.demo.cfdi
+        collection = conn[DB_NAME][COLLECTION_NAME]
         result = collection.insert_one(doc)
         return result
     except Exception as e:
