@@ -9,7 +9,7 @@ Converts Mexican electronic invoices (CFDI XML files) into JSON documents and lo
 1. Recursively walks a directory and picks up every `*.xml` file whose root element is `cfdi:Comprobante`.
 2. Converts each XML element into a document: attributes and child elements become fields, XML namespace prefixes are removed (e.g. `{http://www.sat.gob.mx/cfd/3}Comprobante` becomes `Comprobante`), and element text is stored in a `value` field.
 3. Moves the certificate and digital seal fields into a separate signature document (see [Signatures](#signatures)).
-4. Writes the documents to the configured collections (`demo.cfdi` and `demo.cfdi_signatures` by default) in batches of 500, replacing any existing document with the same `_id`. Running the script again on the same files therefore updates invoices instead of duplicating them.
+4. Writes the documents to the configured collections (`demo_cfdi.cfdi` and `demo_cfdi.cfdi_signatures` by default) in batches of 500, replacing any existing document with the same `_id`. Running the script again on the same files therefore updates invoices instead of duplicating them.
 
 Files that fail to parse, convert, or pass schema validation are reported on the console with their file name and skipped. The run ends with a summary of inserted, replaced, and failed files.
 
@@ -62,7 +62,7 @@ Elements that can repeat in a CFDI are always stored as arrays, even when a file
 Certificates, digital seals, and payment chains (`Certificado`, `Sello`, `SelloCFD`, `SelloSAT`, `CertPago`, `SelloPago`, `CadPago`) are base64 strings of several kilobytes that are only needed for audits. They are removed from the invoice and stored in the signatures collection under the same `_id`, keeping their original nested path:
 
 ```javascript
-// demo.cfdi_signatures
+// demo_cfdi.cfdi_signatures
 {
   _id: "D6657733-57A1-492F-905F-ED7FFC19E486",
   Comprobante: {
@@ -114,7 +114,7 @@ Then edit `.env` with your values. Environment variables already set in the shel
 | Variable             | `.env.example` value         | Description                                  |
 |----------------------|------------------------------|----------------------------------------------|
 | `MONGODB_URI`        | `mongodb://localhost:27017`  | MongoDB connection string                    |
-| `MONGODB_DATABASE`   | `demo`                       | Target database                              |
+| `MONGODB_DATABASE`   | `demo_cfdi`                  | Target database                              |
 | `MONGODB_COLLECTION` | `cfdi`                       | Target collection                            |
 | `MONGODB_SIGNATURES_COLLECTION` | `cfdi_signatures` | Collection for certificates and seals (default: `<MONGODB_COLLECTION>_signatures`) |
 | `DATADIR`            | `./xmls`                     | Directory scanned when no argument is given  |
@@ -148,7 +148,7 @@ The `xmls/` directory contains 24 sample CFDI 3.3 invoices, including payment (`
 ## Example queries
 
 ```javascript
-use demo
+use demo_cfdi
 
 // Look up an invoice by UUID (uses the _id index)
 db.cfdi.findOne({ _id: "D6657733-57A1-492F-905F-ED7FFC19E486" })
@@ -172,7 +172,7 @@ No secondary indexes are created. Add indexes once the query patterns are known,
 v0.1 stored documents with `ObjectId` `_id`s, numbers as `double`, and no `schemaVersion`. The script prints a warning when it finds such documents. Schema version 2 kept the signature fields inside the invoice. In both cases, drop the collections and re-import:
 
 ```javascript
-use demo
+use demo_cfdi
 db.cfdi.drop()
 db.cfdi_signatures.drop()
 ```
@@ -196,6 +196,4 @@ Pending work, in suggested order:
    - Repeatable elements such as `TrasladoDR`, `RetencionDR`, `TrasladoP`, and `RetencionP` are not in `ARRAY_KEYS`, so they are stored as an object when they appear once and as an array when they repeat.
    - Add anonymized CFDI 4.0 samples to `xmls/` to verify the changes.
 2. **Automated tests.** Add unit tests (no MongoDB needed) for value conversion, array handling, signature extraction, and `_id` assignment.
-3. **Default database name.** The code default and the examples in this README use `demo`, while `.env.example` uses `demo_cfdi`. Align them.
-4. **Atlas access.** Use a database user limited to `readWrite` on the target database, and restrict the cluster's IP access list to the machines that run the import.
-5. **Secondary indexes.** Create indexes once the main query patterns are known (see [Example queries](#example-queries)).
+3. **Secondary indexes.** Create indexes once the main query patterns are known (see [Example queries](#example-queries)).

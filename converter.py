@@ -29,7 +29,7 @@ def load_env(path):
 load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 URI_STRING = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
-DB_NAME = os.environ.get("MONGODB_DATABASE", "demo")
+DB_NAME = os.environ.get("MONGODB_DATABASE", "demo_cfdi")
 COLLECTION_NAME = os.environ.get("MONGODB_COLLECTION", "cfdi")
 SIGNATURES_COLLECTION_NAME = os.environ.get("MONGODB_SIGNATURES_COLLECTION", COLLECTION_NAME + "_signatures")
 
