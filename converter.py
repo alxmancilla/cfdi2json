@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # Python 3 only
 
-from xmljson import GData
+from collections import Counter
+from decimal import Decimal, DecimalException
 from xml.etree.ElementTree import fromstring
+from bson.decimal128 import Decimal128
 import pymongo
-from pymongo import InsertOne, ReplaceOne
-from pymongo.errors import BulkWriteError, ConnectionFailure, OperationFailure
-import json
-import fnmatch
-import os
+from pymongo import ReplaceOne
+from pymongo.errors import BulkWriteError, CollectionInvalid, ConnectionFailure, OperationFailure
 import datetime
-import re
+import fnmatch
+import hashlib
+import os
 import sys
 
 def load_env(path):
@@ -30,270 +31,279 @@ load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 URI_STRING = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME = os.environ.get("MONGODB_DATABASE", "demo")
 COLLECTION_NAME = os.environ.get("MONGODB_COLLECTION", "cfdi")
+SIGNATURES_COLLECTION_NAME = os.environ.get("MONGODB_SIGNATURES_COLLECTION", COLLECTION_NAME + "_signatures")
 
 DATADIR = os.environ.get("DATADIR", "./xmls")
 
 BATCH_SIZE = 500
-UUID_FIELD = "Comprobante.Complemento.TimbreFiscalDigital.UUID"
+SCHEMA_VERSION = 3
+TEXT_KEY = "value"
+DATE_PREFIX = "Fecha"
+DATE_FORMATS = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d")
 
-VALUE = "$t"
-EMPTY = "\""
-regex = re.compile(r"\"\{http.*\w\}")
-# only plain numbers become int/float; codes with leading zeros, exponents or more than 15 digits stay strings
-NUMBER = re.compile(r"^-?(0|[1-9][0-9]{0,14})(\.[0-9]+)?$")
-DATE_FORMATS = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f")
-NOMINA_STRING_KEYS = {
-    "Banco", "Clave", "CuentaBancaria", "NumEmpleado", "NumSeguridadSocial",
-    "PeriodicidadPago", "RegistroPatronal", "RiesgoPuesto", "TipoContrato",
-    "TipoDeduccion", "TipoHoras", "TipoIncapacidad", "TipoJornada",
-    "TipoOtroPago", "TipoPercepcion", "TipoRegimen",
+# attribute values are stored as strings, except amounts (Decimal128), counters (int) and dates
+DECIMAL_PREFIX = "Total"
+DECIMAL_KEYS = {
+    "Base", "Cantidad", "Descuento", "ImpPagado", "ImpSaldoAnt", "ImpSaldoInsoluto",
+    "Importe", "ImporteExento", "ImporteGravado", "ImportePagado", "IngresoAcumulable",
+    "IngresoNoAcumulable", "Monto", "MontoDiario", "NumDiasPagados", "SalarioBaseCotApor",
+    "SalarioDiarioIntegrado", "SubTotal", "SubsidioCausado", "TasaOCuota", "TipoCambio",
+    "TipoCambioP", "ValorUnitario",
+}
+INT_KEYS = {"NumParcialidad"}
+
+# CFDI elements that may repeat are always stored as arrays
+ARRAY_KEYS = {
+    "CfdiRelacionado", "Concepto", "ConceptoConsumoDeCombustibles",
+    "ConceptoEstadoDeCuentaCombustible", "Deduccion", "Determinado", "DoctoRelacionado",
+    "HorasExtra", "Incapacidad", "InformacionAduanera", "Nomina", "OtroPago", "Pago",
+    "Pagos", "Parte", "Percepcion", "Retencion", "SubContratacion", "Traslado",
+}
+
+# certificates, digital seals and payment chains are large and rarely read; stored in the signatures collection
+SIGNATURE_KEYS = {"CadPago", "CertPago", "Certificado", "Sello", "SelloCFD", "SelloPago", "SelloSAT"}
+
+STRING = {"bsonType": "string"}
+DECIMAL = {"bsonType": "decimal"}
+DATE = {"bsonType": "date"}
+PARTY = {"bsonType": "object", "required": ["Rfc"], "properties": {"Rfc": STRING}}
+VALIDATOR = {
+    "$jsonSchema": {
+        "bsonType": "object",
+        "required": ["schemaVersion", "source", "Comprobante"],
+        "properties": {
+            "schemaVersion": {"bsonType": "int", "enum": [SCHEMA_VERSION]},
+            "source": {
+                "bsonType": "object",
+                "required": ["file", "importedAt"],
+                "properties": {"file": STRING, "importedAt": DATE},
+            },
+            "Comprobante": {
+                "bsonType": "object",
+                "required": ["Version", "Fecha", "SubTotal", "Total", "Emisor", "Receptor", "Conceptos"],
+                "properties": {
+                    "Version": STRING,
+                    "Fecha": DATE,
+                    "SubTotal": DECIMAL,
+                    "Total": DECIMAL,
+                    "Emisor": PARTY,
+                    "Receptor": PARTY,
+                    "Conceptos": {
+                        "bsonType": "object",
+                        "required": ["Concepto"],
+                        "properties": {"Concepto": {"bsonType": "array", "minItems": 1}},
+                    },
+                    "Complemento": {
+                        "bsonType": "object",
+                        "properties": {
+                            "TimbreFiscalDigital": {
+                                "bsonType": "object",
+                                "required": ["UUID", "FechaTimbrado"],
+                                "properties": {"UUID": STRING, "FechaTimbrado": DATE},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+SIGNATURES_VALIDATOR = {
+    "$jsonSchema": {
+        "bsonType": "object",
+        "required": ["schemaVersion", "Comprobante"],
+        "properties": {
+            "schemaVersion": {"bsonType": "int", "enum": [SCHEMA_VERSION]},
+            "Comprobante": {"bsonType": "object"},
+        },
+    },
 }
 
 
-def parse_value(value):
-    if value is None or not NUMBER.match(value):
-        return value
-    if "." in value:
-        return float(value)
-    return int(value)
+def local_name(name):
+    # drop the XML namespace, e.g. {http://www.sat.gob.mx/cfd/3}Comprobante -> Comprobante
+    return name.rsplit("}", 1)[-1]
 
 
-bf = GData(xml_fromstring=parse_value)
-
-
-def parse_date(value):
+def parse_date(key, value):
     for date_format in DATE_FORMATS:
         try:
             return datetime.datetime.strptime(value, date_format)
         except ValueError:
             pass
-    print("Warning: unrecognized Fecha format, stored as string:", value)
+    print("Warning: unrecognized date in %s, stored as string: %s" % (key, value))
     return value
 
 
-def stringify_keys(node, keys):
-    # convert numeric values of the given keys to strings at any depth
+def convert_value(key, value):
+    if key in DECIMAL_KEYS or key.startswith(DECIMAL_PREFIX):
+        try:
+            number = Decimal(value)
+            if number.is_finite():
+                return Decimal128(number)
+        except DecimalException:
+            pass
+        print("Warning: invalid amount in %s, stored as string: %s" % (key, value))
+        return value
+    if key in INT_KEYS:
+        try:
+            return int(value)
+        except ValueError:
+            print("Warning: invalid integer in %s, stored as string: %s" % (key, value))
+            return value
+    if key.startswith(DATE_PREFIX):
+        return parse_date(key, value)
+    return value
+
+
+def element_to_dict(element):
+    node = {}
+    for name, value in element.attrib.items():
+        key = local_name(name)
+        node[key] = convert_value(key, value)
+    if element.text and element.text.strip():
+        node[TEXT_KEY] = element.text
+    children = [child for child in element if isinstance(child.tag, str)]
+    counts = Counter(local_name(child.tag) for child in children)
+    for child in children:
+        key = local_name(child.tag)
+        value = element_to_dict(child)
+        if key in ARRAY_KEYS or counts[key] > 1:
+            items = node.get(key)
+            if not isinstance(items, list):
+                items = node[key] = []
+            items.append(value)
+        else:
+            node[key] = value
+    return node
+
+
+def extract_signatures(node):
+    # remove signature fields from node and return them in the same nested shape (None if there are none)
     if isinstance(node, list):
-        for item in node:
-            stringify_keys(item, keys)
-    elif isinstance(node, dict):
-        for key, value in node.items():
-            if key in keys and isinstance(value, (int, float)):
-                node[key] = str(value)
-            else:
-                stringify_keys(value, keys)
+        extracted = [extract_signatures(item) or {} for item in node]
+        return extracted if any(extracted) else None
+    if not isinstance(node, dict):
+        return None
+    extracted = {}
+    for key in list(node):
+        if key in SIGNATURE_KEYS:
+            extracted[key] = node.pop(key)
+        else:
+            value = extract_signatures(node[key])
+            if value:
+                extracted[key] = value
+    return extracted or None
 
 
-def traverse_directories(conn, base_dir, batch):
-    print("directory: ", base_dir)
-    list_files = os.listdir(base_dir)
-    for a in list_files:
-            file_name = os.path.join(base_dir, a)
-            if os.path.isdir(file_name):
-                traverse_directories(conn, file_name, batch)
-            elif fnmatch.fnmatch(a, '*.xml'):
-                try:
-                    document = convertXML2JSON(file_name)
-                    document = coerceDataTypes(document)
-                except Exception as e:
-                    print("Exception filename", file_name)
-                    print("Exception e: ", e)
-                    continue
-                batch.append((file_name, document))
-                if len(batch) >= BATCH_SIZE:
-                    write_documents(conn, batch)
-                    batch.clear()
-
-
-def coerceDataTypes(document):
-    comprobante = document["Comprobante"]
-    for item in comprobante:
-        if item == "NoCertificado":
-            comprobante["NoCertificado"] = str(comprobante["NoCertificado"])
-        elif item == "Fecha":
-            comprobante["Fecha"] = parse_date(str(comprobante["Fecha"]))
-        elif item == "Folio":
-            comprobante["Folio"] = str(comprobante["Folio"])
-        elif item == "Serie":
-            comprobante["Serie"] = str(comprobante["Serie"])
-        elif item == "CuentaPredial":
-            comprobante["CuentaPredial"]["Numero"] = str(comprobante["CuentaPredial"]["Numero"])
-        elif item == "Complemento":
-            #print("Complemento: ... ", comprobante["Complemento"])
-            for compitem in comprobante["Complemento"]:
-                if compitem == "CFDIRegistroFiscal":
-                    comprobante["Complemento"]["CFDIRegistroFiscal"]["Folio"] = str(comprobante["Complemento"]["CFDIRegistroFiscal"]["Folio"])
-                if compitem == "TimbreFiscalDigital":
-                    comprobante["Complemento"]["TimbreFiscalDigital"]["NoCertificadoSAT"] = str(comprobante["Complemento"]["TimbreFiscalDigital"]["NoCertificadoSAT"])
-
-                if compitem == "Nomina":
-                    stringify_keys(comprobante["Complemento"]["Nomina"], NOMINA_STRING_KEYS)
-
-                if compitem == "ConsumoDeCombustibles":
-                    #print("ConsumoDeCombustibles: ... ", comprobante["Complemento"]["ConsumoDeCombustibles"])
-                    cdc = comprobante["Complemento"]["ConsumoDeCombustibles"]
-                    if isinstance(cdc, dict):
-                        for keys in cdc:
-                            if keys == "Conceptos":
-                                conceptos = comprobante["Complemento"]["ConsumoDeCombustibles"]["Conceptos"]
-                                for ceccItem in conceptos["ConceptoConsumoDeCombustibles"]:
-                                    if isinstance(ceccItem, dict):
-                                        for keys in ceccItem:
-                                            if keys == "Identificador":
-                                                #print("Identificador ...")
-                                                ceccItem["Identificador"] = str(ceccItem["Identificador"])
-                                            elif keys == "identificador": 
-                                                ceccItem["identificador"] = str(ceccItem["identificador"])
-                                            elif keys == "Determinados": 
-                                                determinados = ceccItem["Determinados"]                     
-                    
-
-                if compitem == "EstadoDeCuentaCombustible":
-                    edcc = comprobante["Complemento"]["EstadoDeCuentaCombustible"]
-                    if isinstance(edcc, dict):
-                        for keys in edcc:
-                            if keys == "Conceptos":
-                                conceptos = edcc["Conceptos"]
-                                for ceccItem in conceptos["ConceptoEstadoDeCuentaCombustible"]:
-                                    if isinstance(ceccItem, dict):
-                                        for keys in ceccItem:
-                                            if keys == "Identificador":
-                                                ceccItem["Identificador"] = str(ceccItem["Identificador"])
-            
-                if compitem == "Pagos":
-                    if isinstance(comprobante["Complemento"]["Pagos"], dict): 
-                        comprobante["Complemento"]["Pagos"] = [comprobante["Complemento"]["Pagos"]]
-                    for pagos in comprobante["Complemento"]["Pagos"]:              
-                        if isinstance(pagos["Pago"], dict):
-                            for pagoItem in pagos["Pago"]:
-                                if pagoItem == "NumOperacion":
-                                    pagos["Pago"]["NumOperacion"] = str(pagos["Pago"]["NumOperacion"])
-                                elif pagoItem == "CtaOrdenante":
-                                    pagos["Pago"]["CtaOrdenante"] = str(pagos["Pago"]["CtaOrdenante"])
-                                elif pagoItem == "CtaBeneficiario":
-                                    pagos["Pago"]["CtaBeneficiario"] = str(pagos["Pago"]["CtaBeneficiario"])
-                                elif pagoItem == "CadPago":
-                                    pagos["Pago"]["CadPago"] = str(pagos["Pago"]["CadPago"])
-                                elif pagoItem == "CertPago":
-                                    pagos["Pago"]["CertPago"] = str(pagos["Pago"]["CertPago"])
-                                elif pagoItem == "SelloPago":
-                                    pagos["Pago"]["SelloPago"] = str(pagos["Pago"]["SelloPago"])
-                                elif pagoItem == "DoctoRelacionado":
-                                    if isinstance(pagos["Pago"]["DoctoRelacionado"], dict):
-                                        pagos["Pago"]["DoctoRelacionado"] = [pagos["Pago"]["DoctoRelacionado"]]
-                                    for docItem in pagos["Pago"]["DoctoRelacionado"]:
-                                        if isinstance(docItem, dict):
-                                            for keys in docItem:
-                                                if keys == "Folio":
-                                                    docItem["Folio"] = str(docItem["Folio"])                                                 
-        elif item == "Conceptos":
-            conceptos = comprobante["Conceptos"]
-            if isinstance(conceptos, dict):
-                conceptos = [conceptos]
-            for concepto in conceptos:
-                for keys in concepto["Concepto"]:
-                    if keys == "NoIdentificacion":
-                        concepto["Concepto"]["NoIdentificacion"] = str(concepto["Concepto"]["NoIdentificacion"])
-                    elif keys == "Parte":
-                        partes = concepto["Concepto"]["Parte"]
-                        if isinstance(concepto["Concepto"]["Parte"], dict):
-                            partes = [concepto["Concepto"]["Parte"]]
-                        for parte in partes:
-                            for llaves in parte:
-                                if llaves == "NoIdentificacion":
-                                    parte["NoIdentificacion"] = str(parte["NoIdentificacion"])
-                    elif isinstance(keys, dict):
-                        for llaves in keys:
-                            if llaves == "NoIdentificacion":
-                                keys["NoIdentificacion"] = str(keys["NoIdentificacion"])
-                            elif llaves == "Parte":
-                                parte = keys["Parte"]
-                                for parteItem in parte:
-                                    if parteItem == "NoIdentificacion":
-                                        parte["NoIdentificacion"] = str(parte["NoIdentificacion"])        
-        elif item == "Emisor":
-            for emisorItem in comprobante["Emisor"]:
-                if emisorItem == "Nombre":
-                    comprobante["Emisor"]["Nombre"] = str(comprobante["Emisor"]["Nombre"])
-                if emisorItem == "Rfc":
-                    comprobante["Emisor"]["Rfc"] = str(comprobante["Emisor"]["Rfc"])
-        elif item == "Receptor":
-            for receptorItem in comprobante["Receptor"]:
-                if receptorItem == "Nombre":
-                    comprobante["Receptor"]["Nombre"] = str(comprobante["Receptor"]["Nombre"])
-                if receptorItem == "Rfc":
-                    comprobante["Receptor"]["Rfc"] = str(comprobante["Receptor"]["Rfc"])
-    items = comprobante["Conceptos"]["Concepto"]
-    
-    if isinstance(items, dict):
-        items = [items]    
-
-    if isinstance(items, list):
-        for item in items:
-            if isinstance(item, dict):
-                for keys in item:
-                    if keys == "NoIdentificacion":
-                        item["NoIdentificacion"] = str(item["NoIdentificacion"])
-                    elif keys == "ClaveProdServ":
-                        item["ClaveProdServ"] = str(item["ClaveProdServ"])
-                    elif keys == "CuentaPredial":
-                        item["CuentaPredial"]["Numero"] = str(item["CuentaPredial"]["Numero"])
-
-    return document
-    
-    
-def convertXML2JSON(file):
-    # open the XML file, convert to json and return it as an object
-    with open(file, "rb") as input:
-        jsonOut = bf.data(fromstring(input.read()))
-        jsonString = json.dumps(jsonOut, indent=2)
-
-        result = regex.sub(EMPTY, jsonString)
-        result = result.replace(VALUE, "value")
-
-    return json.loads(result)
-
-
-def get_uuid(doc):
-    complementos = doc["Comprobante"].get("Complemento")
-    if not isinstance(complementos, list):
-        complementos = [complementos]
-    for complemento in complementos:
-        if isinstance(complemento, dict) and isinstance(complemento.get("TimbreFiscalDigital"), dict):
-            return complemento["TimbreFiscalDigital"].get("UUID")
+def get_timbre(document):
+    complemento = document["Comprobante"].get("Complemento")
+    if isinstance(complemento, dict) and isinstance(complemento.get("TimbreFiscalDigital"), dict):
+        return complemento["TimbreFiscalDigital"]
     return None
 
 
-def ensure_indexes(conn):
-    collection = conn[DB_NAME][COLLECTION_NAME]
+def convert_file(file_name):
+    with open(file_name, "rb") as input:
+        content = input.read()
+    root = fromstring(content)
+    if local_name(root.tag) != "Comprobante":
+        raise ValueError("root element is %s, expected Comprobante" % local_name(root.tag))
+    document = {"Comprobante": element_to_dict(root)}
+    timbre = get_timbre(document)
+    if timbre and isinstance(timbre.get("UUID"), str):
+        # SAT UUIDs are case-insensitive; normalize so the same invoice always maps to the same _id
+        timbre["UUID"] = timbre["UUID"].upper()
+        document["_id"] = timbre["UUID"]
+    else:
+        # unstamped CFDI: identify by file content so re-runs replace instead of duplicating
+        document["_id"] = "sha256:" + hashlib.sha256(content).hexdigest()
+    document["schemaVersion"] = SCHEMA_VERSION
+    document["source"] = {"file": file_name, "importedAt": datetime.datetime.now(datetime.timezone.utc)}
+    signatures = extract_signatures(document["Comprobante"])
+    if signatures:
+        signatures = {"_id": document["_id"], "Comprobante": signatures, "schemaVersion": SCHEMA_VERSION}
+    return document, signatures
+
+
+def import_directory(db, base_dir):
+    stats = Counter()
+    batch = []
+    for directory, subdirs, files in os.walk(base_dir):
+        subdirs.sort()
+        print("directory: ", directory)
+        for name in sorted(fnmatch.filter(files, "*.xml")):
+            file_name = os.path.join(directory, name)
+            try:
+                document, signatures = convert_file(file_name)
+            except Exception as e:
+                print("Exception filename", file_name)
+                print("Exception e: ", e)
+                stats["failed"] += 1
+                continue
+            batch.append((file_name, document, signatures))
+            if len(batch) >= BATCH_SIZE:
+                stats.update(write_batch(db, batch))
+                batch = []
+    if batch:
+        stats.update(write_batch(db, batch))
+    return stats
+
+
+def ensure_collection(db, name, validator):
+    # $jsonSchema validator rejects documents with missing core fields or wrong types
+    options = {"validator": validator, "validationLevel": "strict", "validationAction": "error"}
     try:
-        collection.create_index(UUID_FIELD, unique=True,
-                                partialFilterExpression={UUID_FIELD: {"$exists": True}})
+        db.create_collection(name, **options)
+        print("created collection %s with schema validation" % name)
+    except CollectionInvalid:
+        try:
+            db.command("collMod", name, **options)
+        except OperationFailure as e:
+            print("Warning: could not update schema validation on %s: %s" % (name, e))
     except OperationFailure as e:
-        print("Warning: could not create unique index on %s: %s" % (UUID_FIELD, e))
+        print("Warning: could not create collection %s: %s" % (name, e))
 
 
-def write_documents(conn, batch):
-    # upsert stamped CFDIs by UUID so re-runs do not create duplicates
-    collection = conn[DB_NAME][COLLECTION_NAME]
-    requests = []
-    for file_name, doc in batch:
-        uuid = get_uuid(doc)
-        if uuid:
-            requests.append(ReplaceOne({UUID_FIELD: uuid}, doc, upsert=True))
-        else:
-            requests.append(InsertOne(doc))
+def ensure_collections(db):
+    ensure_collection(db, COLLECTION_NAME, VALIDATOR)
+    ensure_collection(db, SIGNATURES_COLLECTION_NAME, SIGNATURES_VALIDATOR)
+    # documents imported before schema version 2 use ObjectId _ids; this lookup is served by the _id index
+    if db[COLLECTION_NAME].find_one({"_id": {"$type": "objectId"}}, {"_id": 1}):
+        print("Warning: %s contains documents from an earlier schema version; "
+              "drop the collection and re-import to avoid duplicates" % COLLECTION_NAME)
+
+
+def write_documents(collection, items):
+    # replace by _id: a re-imported invoice overwrites its previous version
+    # items: list of (file_name, document); returns (stats, indexes of failed items)
+    requests = [ReplaceOne({"_id": doc["_id"]}, doc, upsert=True) for _, doc in items]
     try:
         result = collection.bulk_write(requests, ordered=False)
-        print("batch written: %d new without UUID, %d new by UUID, %d existing replaced"
-              % (result.inserted_count, result.upserted_count, result.matched_count))
+        details = {"nUpserted": result.upserted_count, "nMatched": result.matched_count, "writeErrors": []}
     except BulkWriteError as e:
-        for error in e.details["writeErrors"]:
+        details = e.details
+        for error in details["writeErrors"]:
             print("¡¡¡ERROR!!!!", error["errmsg"])
-            print("filename: " + batch[error["index"]][0])
+            print("filename: " + items[error["index"]][0])
     except Exception as e:
         print("¡¡¡ERROR!!!!", e)
-        print("files in failed batch:", [file_name for file_name, _ in batch])
+        print("files in failed batch:", [file_name for file_name, _ in items])
+        return Counter(failed=len(items)), set(range(len(items)))
+    stats = Counter(inserted=details["nUpserted"], replaced=details["nMatched"],
+                    failed=len(details["writeErrors"]))
+    return stats, {error["index"] for error in details["writeErrors"]}
+
+
+def write_batch(db, batch):
+    stats, failed = write_documents(db[COLLECTION_NAME], [(f, doc) for f, doc, _ in batch])
+    print("batch written: %(inserted)d inserted, %(replaced)d replaced, %(failed)d failed" % stats)
+    # signatures are written only for invoices that were stored, so no orphan signature documents are created
+    signatures = [(f, sig) for i, (f, _, sig) in enumerate(batch) if sig and i not in failed]
+    if signatures:
+        signature_stats, _ = write_documents(db[SIGNATURES_COLLECTION_NAME], signatures)
+        stats["signatures_failed"] = signature_stats["failed"]
+    return stats
 
 
 if __name__ == "__main__":
@@ -301,22 +311,26 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         print("This is the argument of the script: ", sys.argv[1])
         DATADIR = sys.argv[1]
+    if not os.path.isdir(DATADIR):
+        sys.exit("Directory not found: %s" % DATADIR)
     conn = None
     try:
-        conn = pymongo.MongoClient(URI_STRING, serverSelectionTimeoutMS=5000)
+        # single-threaded batch job: the default pool is sufficient; fail fast if the server is unreachable
+        conn = pymongo.MongoClient(URI_STRING, appname="cfdi2json", serverSelectionTimeoutMS=5000)
         conn.admin.command("ping")
         print("Connected to MongoDB")
-        ensure_indexes(conn)
-        start_time = datetime.datetime.utcnow()
+        db = conn[DB_NAME]
+        ensure_collections(db)
+        start_time = datetime.datetime.now(datetime.timezone.utc)
         print("start time: ", start_time)
-        batch = []
-        traverse_directories(conn, DATADIR, batch)
-        if batch:
-            write_documents(conn, batch)
-        end_time = datetime.datetime.utcnow()
+        stats = import_directory(db, DATADIR)
+        end_time = datetime.datetime.now(datetime.timezone.utc)
         print("end time: ", end_time)
         print("%.2f seconds" % (end_time - start_time).total_seconds())
-        print("Operation completed successfully!!!")
+        print("summary: %d inserted, %d replaced, %d failed, %d signature writes failed"
+              % (stats["inserted"], stats["replaced"], stats["failed"], stats["signatures_failed"]))
+        ok = not stats["failed"] and not stats["signatures_failed"]
+        print("Operation completed successfully!!!" if ok else "Operation completed with errors")
     except ConnectionFailure as e:
         print("Could not connect to MongoDB: %s" % e)
     finally:
